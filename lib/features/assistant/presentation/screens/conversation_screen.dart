@@ -160,6 +160,7 @@ class _MessageBuilder extends ConsumerWidget {
         return AssistantBubble(
           text: message.text ?? '',
           actions: message.actions,
+          isStreaming: message.isStreaming,
           onAction: (action) {
             ref
                 .read(assistantControllerProvider.notifier)
@@ -183,8 +184,6 @@ class _MessageBuilder extends ConsumerWidget {
       case ChatContentKind.consentProposal:
         final proposal = message.consentProposal;
         if (proposal == null) return const SizedBox.shrink();
-        final state = ref.watch(assistantControllerProvider);
-        final isActive = state.activeConsentProposalMessageId == message.id;
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -192,7 +191,7 @@ class _MessageBuilder extends ConsumerWidget {
               AssistantBubble(text: message.text!),
             ConsentMomentCard(
               proposal: proposal,
-              decided: !isActive,
+              decision: message.consentDecision,
               onAllow: () {
                 ref
                     .read(assistantControllerProvider.notifier)

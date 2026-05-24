@@ -44,6 +44,7 @@ class ChatMessage {
     this.handoff,
     this.actions = const [],
     this.isStreaming = false,
+    this.consentDecision,
   });
 
   final String id;
@@ -57,10 +58,17 @@ class ChatMessage {
   final List<ChatAction> actions;
   final bool isStreaming;
 
+  /// For a [ChatContentKind.consentProposal] message: null until the
+  /// citizen decides, then true (Allow) or false (Decline). Drives the
+  /// card's button/status rendering directly, so the UI does not depend
+  /// on any global "active proposal" flag.
+  final bool? consentDecision;
+
   ChatMessage copyWith({
     String? text,
     bool? isStreaming,
     List<ChatAction>? actions,
+    Object? consentDecision = _sentinel,
   }) {
     return ChatMessage(
       id: id,
@@ -73,6 +81,11 @@ class ChatMessage {
       handoff: handoff,
       actions: actions ?? this.actions,
       isStreaming: isStreaming ?? this.isStreaming,
+      consentDecision: identical(consentDecision, _sentinel)
+          ? this.consentDecision
+          : consentDecision as bool?,
     );
   }
 }
+
+const _sentinel = Object();

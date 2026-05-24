@@ -9,14 +9,16 @@ class ConsentMomentCard extends StatelessWidget {
     required this.proposal,
     required this.onAllow,
     required this.onDecline,
-    this.decided = false,
     this.decision,
   });
 
   final ConsentProposal proposal;
   final VoidCallback onAllow;
   final VoidCallback onDecline;
-  final bool decided;
+
+  /// null  → buttons (citizen hasn't decided)
+  /// true  → green tick + "Consent granted"
+  /// false → red cross + "Consent declined"
   final bool? decision;
 
   @override
@@ -123,7 +125,7 @@ class ConsentMomentCard extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: AppSpacing.md),
-              if (!decided)
+              if (decision == null)
                 Row(
                   children: [
                     Expanded(

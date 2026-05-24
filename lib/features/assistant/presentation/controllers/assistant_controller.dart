@@ -4,10 +4,9 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../data/assistant_repository.dart';
 import '../../domain/models/chat_message.dart';
 import '../../domain/models/chat_thread.dart';
-import '../../domain/models/consent_proposal.dart';
-import '../../domain/models/verified_fact.dart';
 
 @immutable
 class AssistantState {
@@ -15,7 +14,7 @@ class AssistantState {
     required this.threads,
     required this.activeThreadId,
     required this.isAssistantTyping,
-    this.activeConsentProposalMessageId,
+    this.lastError,
   });
 
   factory AssistantState.initial() {
@@ -29,7 +28,7 @@ class AssistantState {
   final List<ChatThread> threads;
   final String activeThreadId;
   final bool isAssistantTyping;
-  final String? activeConsentProposalMessageId;
+  final String? lastError;
 
   ChatThread get activeThread =>
       threads.firstWhere((t) => t.id == activeThreadId);
@@ -38,16 +37,15 @@ class AssistantState {
     List<ChatThread>? threads,
     String? activeThreadId,
     bool? isAssistantTyping,
-    Object? activeConsentProposalMessageId = _sentinel,
+    Object? lastError = _sentinel,
   }) {
     return AssistantState(
       threads: threads ?? this.threads,
       activeThreadId: activeThreadId ?? this.activeThreadId,
       isAssistantTyping: isAssistantTyping ?? this.isAssistantTyping,
-      activeConsentProposalMessageId:
-          identical(activeConsentProposalMessageId, _sentinel)
-          ? this.activeConsentProposalMessageId
-          : activeConsentProposalMessageId as String?,
+      lastError: identical(lastError, _sentinel)
+          ? this.lastError
+          : lastError as String?,
     );
   }
 }
@@ -55,14 +53,26 @@ class AssistantState {
 const _sentinel = Object();
 
 class AssistantController extends StateNotifier<AssistantState> {
-  AssistantController() : super(AssistantState.initial());
+  AssistantController(this._repository) : super(AssistantState.initial());
 
+  final AssistantRepository _repository;
   final _idRandom = math.Random();
-  Timer? _typingTimer;
+
+  // Per-thread bookkeeping that doesn't belong in the UI-facing state.
+  final Map<String, String> _backendThreadIds = {};       // local → backend uuid
+  final Map<String, String> _languageByThread = {};       // local → language
+  final Map<String, String> _lastCitizenText = {};        // for consent retry
+
+  // Pseudonymous citizen id — stable per process. Production would
+  // derive this from a device-anchored secret stored in Keychain.
+  late final String _citizenPseudonym =
+      'mobile-${DateTime.now().millisecondsSinceEpoch}';
 
   String _newId() {
     return '${DateTime.now().millisecondsSinceEpoch}-${_idRandom.nextInt(1 << 32)}';
   }
+
+  // -- Thread management ----------------------------------------------------
 
   void selectThread(String threadId) {
     state = state.copyWith(activeThreadId: threadId);
@@ -78,109 +88,250 @@ class AssistantController extends StateNotifier<AssistantState> {
     state = state.copyWith(
       threads: [thread, ...state.threads],
       activeThreadId: thread.id,
+      lastError: null,
     );
     return thread.id;
   }
 
+  // -- Sending -------------------------------------------------------------
+
   void sendCitizenMessage(String text) {
-    if (text.trim().isEmpty) return;
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return;
     final thread = state.activeThread;
+    _lastCitizenText[thread.id] = trimmed;
+
     final citizenMessage = ChatMessage(
       id: _newId(),
       role: ChatRole.citizen,
       kind: ChatContentKind.text,
       createdAt: DateTime.now(),
-      text: text.trim(),
+      text: trimmed,
     );
     final updatedThread = thread.copyWith(
-      title: thread.messages.length <= 1 ? _summarise(text.trim()) : thread.title,
+      title: thread.messages.length <= 1 ? _summarise(trimmed) : thread.title,
       messages: [...thread.messages, citizenMessage],
       updatedAt: DateTime.now(),
     );
     state = state.copyWith(
       threads: _replaceThread(updatedThread),
       isAssistantTyping: true,
+      lastError: null,
     );
 
-    _typingTimer?.cancel();
-    _typingTimer = Timer(const Duration(milliseconds: 1100), () {
-      _composeAssistantResponse(text.trim());
-    });
+    unawaited(_dispatch(threadLocalId: thread.id, text: trimmed));
   }
 
-  void respondToConsent({required String messageId, required bool granted}) {
-    final thread = state.activeThread;
-    final messages = [...thread.messages];
-    final proposalIndex = messages.indexWhere((m) => m.id == messageId);
-    if (proposalIndex == -1) return;
-    final proposal = messages[proposalIndex].consentProposal;
-    if (proposal == null) return;
+  Future<void> _dispatch({
+    required String threadLocalId,
+    required String text,
+    String? consentToken,
+  }) async {
+    final language = _languageByThread[threadLocalId] ?? 'en';
+    String? streamingMessageId;
+    final accumulated = StringBuffer();
 
-    if (granted) {
-      // Replace proposal with consent-granted note + verified fact
-      final grantedNote = ChatMessage(
-        id: _newId(),
-        role: ChatRole.assistant,
-        kind: ChatContentKind.text,
-        createdAt: DateTime.now(),
-        text:
-            'Thank you — I have recorded your consent through GUVA. Checking '
-            '${proposal.authority} now.',
-      );
-      messages.insert(proposalIndex + 1, grantedNote);
-      state = state.copyWith(
-        threads: _replaceThread(
-          thread.copyWith(messages: messages, updatedAt: DateTime.now()),
-        ),
-        activeConsentProposalMessageId: null,
-        isAssistantTyping: true,
+    try {
+      final stream = _repository.streamMessage(
+        text: text,
+        language: language,
+        citizenId: _citizenPseudonym,
+        threadId: _backendThreadIds[threadLocalId],
+        consentToken: consentToken,
       );
 
-      Timer(const Duration(milliseconds: 1400), () {
-        final factThread = state.activeThread;
-        final verified = _verifiedFactForProposal(proposal);
-        final factMessage = ChatMessage(
-          id: _newId(),
-          role: ChatRole.assistant,
-          kind: ChatContentKind.verifiedFact,
-          createdAt: DateTime.now(),
-          verifiedFact: verified,
-          text:
-              'Here is what the register returned. The facts below are verified '
-              'against ${verified.authoritativeSource} as of just now.',
+      await for (final event in stream) {
+        switch (event) {
+          case StreamStart():
+            _backendThreadIds[threadLocalId] = event.threadId;
+            _languageByThread[threadLocalId] = event.language;
+            break;
+
+          case StreamMessage(:final dto):
+            _appendMessage(threadLocalId, dto.toDomain());
+            state = state.copyWith(isAssistantTyping: false);
+            break;
+
+          case StreamMessageStart(:final messageId):
+            streamingMessageId = messageId;
+            accumulated.clear();
+            _appendMessage(
+              threadLocalId,
+              ChatMessage(
+                id: messageId,
+                role: ChatRole.assistant,
+                kind: ChatContentKind.text,
+                createdAt: DateTime.now(),
+                text: '',
+                isStreaming: true,
+              ),
+            );
+            state = state.copyWith(isAssistantTyping: false);
+            break;
+
+          case StreamDelta(:final messageId, :final text):
+            if (messageId != streamingMessageId) break;
+            accumulated.write(text);
+            _updateMessage(
+              threadLocalId,
+              messageId,
+              (m) => m.copyWith(text: accumulated.toString()),
+            );
+            break;
+
+          case StreamMessageEnd(:final messageId, :final fullText):
+            if (messageId == streamingMessageId) {
+              _updateMessage(
+                threadLocalId,
+                messageId,
+                (m) => m.copyWith(text: fullText, isStreaming: false),
+              );
+              streamingMessageId = null;
+            }
+            break;
+
+          case StreamDone():
+            break;
+
+          case StreamError(:final detail):
+            _appendSystemError(threadLocalId, detail);
+            return;
+        }
+      }
+
+      // Defensive: if the server didn't send a message_end (e.g. socket
+      // dropped) clear the streaming flag so the cursor stops blinking.
+      if (streamingMessageId != null) {
+        final captured = streamingMessageId;
+        _updateMessage(
+          threadLocalId,
+          captured,
+          (m) => m.copyWith(isStreaming: false),
         );
-        final updated = factThread.copyWith(
-          messages: [...factThread.messages, factMessage],
-          updatedAt: DateTime.now(),
-        );
-        state = state.copyWith(
-          threads: _replaceThread(updated),
-          isAssistantTyping: false,
-        );
-      });
-    } else {
-      final declined = ChatMessage(
-        id: _newId(),
-        role: ChatRole.assistant,
-        kind: ChatContentKind.text,
-        createdAt: DateTime.now(),
-        text:
-            'Understood — I will not check ${proposal.authority}. I can still '
-            'walk you through the general procedure, or route you to a human at '
-            'the relevant office.',
-        actions: const [
-          ChatAction(label: 'Route me to a human', actionId: 'handoff'),
-        ],
-      );
-      messages.insert(proposalIndex + 1, declined);
-      state = state.copyWith(
-        threads: _replaceThread(
-          thread.copyWith(messages: messages, updatedAt: DateTime.now()),
-        ),
-        activeConsentProposalMessageId: null,
-      );
+      }
+      state = state.copyWith(isAssistantTyping: false);
+    } on AssistantApiException catch (e) {
+      _appendSystemError(threadLocalId, e.message);
+    } catch (e) {
+      _appendSystemError(threadLocalId, 'Unexpected error: $e');
     }
   }
+
+  void _appendMessage(String threadLocalId, ChatMessage message) {
+    final current = state.threads.firstWhere(
+      (t) => t.id == threadLocalId,
+      orElse: () => state.activeThread,
+    );
+    state = state.copyWith(
+      threads: _replaceThread(
+        current.copyWith(
+          messages: [...current.messages, message],
+          updatedAt: DateTime.now(),
+        ),
+      ),
+    );
+  }
+
+  void _updateMessage(
+    String threadLocalId,
+    String messageId,
+    ChatMessage Function(ChatMessage) update,
+  ) {
+    final current = state.threads.firstWhere(
+      (t) => t.id == threadLocalId,
+      orElse: () => state.activeThread,
+    );
+    final messages = [
+      for (final m in current.messages)
+        if (m.id == messageId) update(m) else m,
+    ];
+    state = state.copyWith(
+      threads: _replaceThread(
+        current.copyWith(messages: messages, updatedAt: DateTime.now()),
+      ),
+    );
+  }
+
+  // -- Consent moment ------------------------------------------------------
+
+  Future<void> respondToConsent({
+    required String messageId,
+    required bool granted,
+  }) async {
+    final thread = state.activeThread;
+    final idx = thread.messages.indexWhere((m) => m.id == messageId);
+    if (idx == -1) return;
+    final proposal = thread.messages[idx].consentProposal;
+    if (proposal == null) return;
+
+    // Mark the proposal message with the decision first, so the card
+    // immediately flips from buttons to a status badge regardless of
+    // anything else we do below.
+    _updateMessage(
+      thread.id,
+      messageId,
+      (m) => m.copyWith(consentDecision: granted),
+    );
+
+    if (!granted) {
+      _appendMessage(
+        thread.id,
+        ChatMessage(
+          id: _newId(),
+          role: ChatRole.assistant,
+          kind: ChatContentKind.text,
+          createdAt: DateTime.now(),
+          text:
+              'Understood — I will not check ${proposal.authority}. I can '
+              'still walk you through the general procedure, or route you '
+              'to a human at the relevant office.',
+          actions: const [
+            ChatAction(label: 'Route me to a human', actionId: 'handoff'),
+          ],
+        ),
+      );
+      return;
+    }
+
+    // Granted: record consent against the GUVA gateway, then re-send.
+    _appendMessage(
+      thread.id,
+      ChatMessage(
+        id: _newId(),
+        role: ChatRole.assistant,
+        kind: ChatContentKind.text,
+        createdAt: DateTime.now(),
+        text:
+            'Thank you — recording your consent with ${proposal.authority} '
+            'and checking now.',
+      ),
+    );
+    state = state.copyWith(isAssistantTyping: true);
+
+    try {
+      final receipt = await _repository.recordConsent(
+        proposal: proposal,
+        citizenId: _citizenPseudonym,
+      );
+      final lastText = _lastCitizenText[thread.id];
+      if (lastText == null) {
+        // Nothing to re-ask; just clear typing.
+        state = state.copyWith(isAssistantTyping: false);
+        return;
+      }
+      await _dispatch(
+        threadLocalId: thread.id,
+        text: lastText,
+        consentToken: receipt.consentId,
+      );
+    } on AssistantApiException catch (e) {
+      _appendSystemError(thread.id, e.message);
+    } catch (e) {
+      _appendSystemError(thread.id, 'Unexpected error: $e');
+    }
+  }
+
+  // -- Actions -------------------------------------------------------------
 
   void runAction(String actionId, {String? sourceMessageId}) {
     final thread = state.activeThread;
@@ -194,12 +345,11 @@ class AssistantController extends StateNotifier<AssistantState> {
             'I have prepared a handoff. Your context will be shared with the '
             'office below so you do not have to start over.',
         handoff: const HandoffSummary(
-          agency: 'Uganda Driver Licensing System',
-          officeName: 'Kampala Central service point',
-          contact: '+256 414 320 600',
+          agency: 'Citizen support desk',
+          officeName: 'National Citizens Helpline',
+          contact: '0800 100 200',
           contextSummary:
-              'Citizen wants to renew expired driving permit. Identity not '
-              'verified in this session.',
+              'Routed from Ask Uganda after the citizen declined a personalised check.',
         ),
       );
       state = state.copyWith(
@@ -213,260 +363,32 @@ class AssistantController extends StateNotifier<AssistantState> {
     }
   }
 
-  void _composeAssistantResponse(String citizenText) {
-    final thread = state.activeThread;
-    final lowered = citizenText.toLowerCase();
+  // -- Helpers -------------------------------------------------------------
 
-    final ChatMessage assistantMessage;
-    if (lowered.contains('permit') ||
-        lowered.contains('licence') ||
-        lowered.contains('license') ||
-        lowered.contains('drive')) {
-      assistantMessage = _permitGuidanceMessage();
-    } else if (lowered.contains('business') ||
-        lowered.contains('register') ||
-        lowered.contains('company')) {
-      assistantMessage = _businessGuidanceMessage();
-    } else if (lowered.contains('passport') ||
-        lowered.contains('travel')) {
-      assistantMessage = _passportGuidanceMessage();
-    } else if (lowered.contains('tax') ||
-        lowered.contains('tin') ||
-        lowered.contains('ura')) {
-      assistantMessage = _taxGuidanceMessage();
-    } else if (lowered.contains('birth') ||
-        lowered.contains('certificate')) {
-      assistantMessage = _birthCertificateGuidanceMessage();
-    } else {
-      assistantMessage = _genericGuidanceMessage(citizenText);
-    }
-
-    final updated = thread.copyWith(
-      messages: [...thread.messages, assistantMessage],
-      updatedAt: DateTime.now(),
+  void _appendSystemError(String threadLocalId, String message) {
+    final current = state.threads.firstWhere(
+      (t) => t.id == threadLocalId,
+      orElse: () => state.activeThread,
+    );
+    final errorMessage = ChatMessage(
+      id: _newId(),
+      role: ChatRole.assistant,
+      kind: ChatContentKind.text,
+      createdAt: DateTime.now(),
+      text:
+          'I could not reach the service just now. Please try again in a '
+          'moment. ($message)',
     );
     state = state.copyWith(
-      threads: _replaceThread(updated),
+      threads: _replaceThread(
+        current.copyWith(
+          messages: [...current.messages, errorMessage],
+          updatedAt: DateTime.now(),
+        ),
+      ),
       isAssistantTyping: false,
+      lastError: message,
     );
-
-    if (assistantMessage.kind == ChatContentKind.consentProposal) {
-      state = state.copyWith(
-        activeConsentProposalMessageId: assistantMessage.id,
-      );
-    }
-  }
-
-  ChatMessage _permitGuidanceMessage() {
-    return ChatMessage(
-      id: _newId(),
-      role: ChatRole.assistant,
-      kind: ChatContentKind.consentProposal,
-      createdAt: DateTime.now(),
-      text:
-          'To renew a driving permit you generally need your National ID, your '
-          'current permit, the renewal fee, and your medical certificate if '
-          'asked. If you would like, I can check your specific permit status '
-          'against the Uganda Driver Licensing System through GUVA.',
-      consentProposal: const ConsentProposal(
-        id: 'cp-permit',
-        authority: 'Uganda Driver Licensing System',
-        purpose: 'Advise on renewal of your driving permit',
-        scopes: [
-          ConsentScope(
-            kind: ConsentScopeKind.identity,
-            label: 'Confirm identity with NIRA',
-            purpose: 'Match your National ID to your name and date of birth',
-          ),
-          ConsentScope(
-            kind: ConsentScopeKind.qualification,
-            label: 'Check driving permit status',
-            purpose: 'Confirm expiry date and any blocking conditions',
-          ),
-        ],
-        validForMinutes: 15,
-      ),
-    );
-  }
-
-  ChatMessage _businessGuidanceMessage() {
-    return ChatMessage(
-      id: _newId(),
-      role: ChatRole.assistant,
-      kind: ChatContentKind.text,
-      createdAt: DateTime.now(),
-      text:
-          'Registering a business in Uganda generally involves URSB business '
-          'name reservation, registration, a tax identification number with '
-          'URA, and any sector-specific licensing. I can map this as a step-by-'
-          'step plan for your situation, or check whether a name you have in '
-          'mind is available.',
-      actions: const [
-        ChatAction(label: 'Show me the full plan', actionId: 'life-event-business'),
-        ChatAction(label: 'Check a business name', actionId: 'verify-business'),
-      ],
-    );
-  }
-
-  ChatMessage _passportGuidanceMessage() {
-    return ChatMessage(
-      id: _newId(),
-      role: ChatRole.assistant,
-      kind: ChatContentKind.consentProposal,
-      createdAt: DateTime.now(),
-      text:
-          'Passport renewal usually requires your existing passport, a National '
-          'ID, and the renewal fee. With your consent I can verify your '
-          'identity against NIRA and confirm whether anything would block the '
-          'application.',
-      consentProposal: const ConsentProposal(
-        id: 'cp-passport',
-        authority: 'Directorate of Citizenship and Immigration Control',
-        purpose: 'Confirm your eligibility to renew a passport',
-        scopes: [
-          ConsentScope(
-            kind: ConsentScopeKind.identity,
-            label: 'Confirm identity with NIRA',
-            purpose: 'Match your National ID to your name and date of birth',
-          ),
-        ],
-        validForMinutes: 15,
-      ),
-    );
-  }
-
-  ChatMessage _taxGuidanceMessage() {
-    return ChatMessage(
-      id: _newId(),
-      role: ChatRole.assistant,
-      kind: ChatContentKind.consentProposal,
-      createdAt: DateTime.now(),
-      text:
-          'I can ask URA for your tax compliance status. This returns whether '
-          'your TIN is currently compliant — it does not show transaction-level '
-          'detail.',
-      consentProposal: const ConsentProposal(
-        id: 'cp-tax',
-        authority: 'Uganda Revenue Authority (URA)',
-        purpose: 'Check compliance status of your TIN',
-        scopes: [
-          ConsentScope(
-            kind: ConsentScopeKind.taxStatus,
-            label: 'Check tax compliance status',
-            purpose: 'Confirm whether your TIN is currently compliant',
-          ),
-        ],
-        validForMinutes: 15,
-      ),
-    );
-  }
-
-  ChatMessage _birthCertificateGuidanceMessage() {
-    return ChatMessage(
-      id: _newId(),
-      role: ChatRole.assistant,
-      kind: ChatContentKind.text,
-      createdAt: DateTime.now(),
-      text:
-          'To obtain a birth certificate you can apply through NIRA, providing '
-          'the child’s notification of birth, the parents’ National IDs, and '
-          'the prescribed fee. Would you like me to walk you through the form '
-          'step by step?',
-      actions: const [
-        ChatAction(label: 'Walk me through the form', actionId: 'form-birth-certificate'),
-      ],
-    );
-  }
-
-  ChatMessage _genericGuidanceMessage(String citizenText) {
-    return ChatMessage(
-      id: _newId(),
-      role: ChatRole.assistant,
-      kind: ChatContentKind.text,
-      createdAt: DateTime.now(),
-      text:
-          'I want to make sure I help you correctly. To stay accurate I only '
-          'speak from curated government information and from verified records '
-          'through GUVA. Could you tell me a little more about what you want '
-          'to achieve so I can route you to the right service?',
-    );
-  }
-
-  VerifiedFact _verifiedFactForProposal(ConsentProposal proposal) {
-    final now = DateTime.now();
-    switch (proposal.id) {
-      case 'cp-permit':
-        return VerifiedFact(
-          title: 'Driving permit status',
-          summary:
-              'Your permit expired on 12 February 2026. No obstacles to renewal '
-              'are recorded. Renewal fee is UGX 60,000.',
-          fields: [
-            const VerifiedField(label: 'Full name', value: 'Amina Nakato'),
-            const VerifiedField(label: 'Permit class', value: 'B (private)'),
-            const VerifiedField(
-              label: 'Expired on',
-              value: '12 February 2026',
-              note: 'Two months overdue — late penalty may apply',
-            ),
-            const VerifiedField(
-              label: 'Renewal fee',
-              value: 'UGX 60,000',
-            ),
-            const VerifiedField(
-              label: 'Service point',
-              value: 'UDLS Kampala Central',
-            ),
-          ],
-          authoritativeSource: 'NIRA + Uganda Driver Licensing System',
-          issuedAt: now,
-          requestId: 'req-${now.millisecondsSinceEpoch}',
-          consentReference: 'csn-${proposal.id}',
-        );
-      case 'cp-passport':
-        return VerifiedFact(
-          title: 'Identity confirmed',
-          summary:
-              'Your identity matches the National Register. No obstacles to a '
-              'passport renewal are recorded.',
-          fields: [
-            const VerifiedField(label: 'Full name', value: 'Amina Nakato'),
-            const VerifiedField(label: 'Date of birth', value: '14 April 1994'),
-            const VerifiedField(label: 'National ID', value: 'CM********1234'),
-          ],
-          authoritativeSource: 'NIRA',
-          issuedAt: now,
-          requestId: 'req-${now.millisecondsSinceEpoch}',
-          consentReference: 'csn-${proposal.id}',
-        );
-      case 'cp-tax':
-        return VerifiedFact(
-          title: 'Tax compliance status',
-          summary:
-              'Your TIN is currently compliant. The next review is scheduled '
-              'for 20 August 2026.',
-          fields: [
-            const VerifiedField(label: 'TIN', value: '1000123456'),
-            const VerifiedField(label: 'Status', value: 'Compliant'),
-            const VerifiedField(label: 'As of', value: '20 May 2026'),
-            const VerifiedField(label: 'Next review', value: '20 August 2026'),
-          ],
-          authoritativeSource: 'Uganda Revenue Authority (URA)',
-          issuedAt: now,
-          requestId: 'req-${now.millisecondsSinceEpoch}',
-          consentReference: 'csn-${proposal.id}',
-        );
-      default:
-        return VerifiedFact(
-          title: 'Verified result',
-          summary: 'The register returned the requested confirmation.',
-          fields: const [],
-          authoritativeSource: proposal.authority,
-          issuedAt: now,
-          requestId: 'req-${now.millisecondsSinceEpoch}',
-          consentReference: 'csn-${proposal.id}',
-        );
-    }
   }
 
   List<ChatThread> _replaceThread(ChatThread updated) {
@@ -493,12 +415,6 @@ class AssistantController extends StateNotifier<AssistantState> {
           'today?',
     );
   }
-
-  @override
-  void dispose() {
-    _typingTimer?.cancel();
-    super.dispose();
-  }
 }
 
 final ChatThread _seedThread = ChatThread(
@@ -522,5 +438,5 @@ final ChatThread _seedThread = ChatThread(
 
 final assistantControllerProvider =
     StateNotifierProvider<AssistantController, AssistantState>(
-      (ref) => AssistantController(),
+      (ref) => AssistantController(ref.watch(assistantRepositoryProvider)),
     );
