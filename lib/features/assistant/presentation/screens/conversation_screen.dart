@@ -77,14 +77,29 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> {
     }
   }
 
-  void _scrollToBottom() {
+  /// Stick to the bottom of the chat while messages are streaming.
+  ///
+  /// We schedule the scroll on the next frame so the new content has
+  /// already been laid out (otherwise maxScrollExtent is stale). For
+  /// streaming deltas we `jumpTo` rather than animate — a 240ms
+  /// animation to a moving target falls behind by the time the next
+  /// delta arrives, and the citizen sees a chasing-the-bottom effect.
+  /// `animate` lets the caller request a smooth scroll on discrete
+  /// events (a new card landing) where there's only one jump to make.
+  void _scrollToBottom({bool animate = false}) {
     if (!_scrollController.hasClients) return;
-    Future.microtask(() {
-      _scrollController.animateTo(
-        _scrollController.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 240),
-        curve: Curves.easeOutCubic,
-      );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollController.hasClients) return;
+      final target = _scrollController.position.maxScrollExtent;
+      if (animate) {
+        _scrollController.animateTo(
+          target,
+          duration: const Duration(milliseconds: 240),
+          curve: Curves.easeOutCubic,
+        );
+      } else {
+        _scrollController.jumpTo(target);
+      }
     });
   }
 

@@ -1,41 +1,11 @@
-// Wire DTOs that mirror the FastAPI Pydantic models in
-// services/orchestration/app/domain/models.py. Kept in their own layer so
-// changes to the wire format never leak into the domain models the UI uses.
+// Wire DTOs the SSE stream parser hands the UI layer. Mirrors the
+// `message` event payload documented in
+// services/orchestration/app/agent/runner.py.
 
 import '../../domain/models/chat_message.dart';
 import '../../domain/models/consent_proposal.dart';
 import '../../domain/models/field_request.dart';
 import '../../domain/models/verified_fact.dart';
-
-class AssistantResponseDto {
-  AssistantResponseDto({
-    required this.threadId,
-    required this.language,
-    required this.intent,
-    required this.messages,
-    required this.groundedSources,
-  });
-
-  final String threadId;
-  final String language;
-  final String intent;
-  final List<AssistantMessageDto> messages;
-  final List<String> groundedSources;
-
-  factory AssistantResponseDto.fromJson(Map<String, dynamic> json) {
-    return AssistantResponseDto(
-      threadId: json['thread_id'] as String,
-      language: json['language'] as String? ?? 'en',
-      intent: json['intent'] as String? ?? 'procedural',
-      messages: ((json['messages'] as List?) ?? const [])
-          .map((m) => AssistantMessageDto.fromJson(m as Map<String, dynamic>))
-          .toList(growable: false),
-      groundedSources: ((json['grounded_sources'] as List?) ?? const [])
-          .map((s) => s as String)
-          .toList(growable: false),
-    );
-  }
-}
 
 class AssistantMessageDto {
   AssistantMessageDto({

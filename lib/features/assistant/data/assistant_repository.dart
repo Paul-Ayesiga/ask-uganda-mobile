@@ -8,8 +8,8 @@ import 'dto/assistant_response_dto.dart';
 import 'sse.dart';
 
 /// Discriminated-union of the events the orchestration SSE stream emits.
-/// Maps to the `event:` lines in services/orchestration/app/domain/orchestrator.py
-/// `handle_stream` docstring.
+/// Maps to the `event:` lines documented in
+/// services/orchestration/app/agent/runner.py.
 sealed class AssistantStreamEvent {
   const AssistantStreamEvent();
 }
@@ -78,37 +78,6 @@ class AssistantRepository {
 
   final Dio orchestration;
   final Dio guvaGateway;
-
-  /// POST /v1/messages on the orchestration service. `consentToken` is
-  /// supplied on the *retry* after the citizen has approved a consent
-  /// proposal; the first call always omits it. `fieldValues` is supplied
-  /// on the *retry* after the citizen filled in a FieldRequest card.
-  Future<AssistantResponseDto> sendMessage({
-    required String text,
-    required String language,
-    required String citizenId,
-    String? threadId,
-    String? consentToken,
-    Map<String, String> fieldValues = const {},
-  }) async {
-    try {
-      final response = await orchestration.post<Map<String, dynamic>>(
-        '/v1/messages',
-        data: {
-          'text': text,
-          'language': language,
-          'channel': AppConfig.channel,
-          'thread_id': ?threadId,
-          'consent_token': ?consentToken,
-          if (fieldValues.isNotEmpty) 'field_values': fieldValues,
-        },
-        options: Options(headers: {'X-Citizen-Id': citizenId}),
-      );
-      return AssistantResponseDto.fromJson(response.data ?? const {});
-    } on DioException catch (e) {
-      throw _translate(e, 'send message');
-    }
-  }
 
   /// POST /v1/consent/record on the GUVA gateway. Returns the consent_id
   /// the caller then re-sends as `consent_token` on the next message.
