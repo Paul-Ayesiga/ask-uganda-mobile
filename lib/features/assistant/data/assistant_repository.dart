@@ -81,13 +81,15 @@ class AssistantRepository {
 
   /// POST /v1/messages on the orchestration service. `consentToken` is
   /// supplied on the *retry* after the citizen has approved a consent
-  /// proposal; the first call always omits it.
+  /// proposal; the first call always omits it. `fieldValues` is supplied
+  /// on the *retry* after the citizen filled in a FieldRequest card.
   Future<AssistantResponseDto> sendMessage({
     required String text,
     required String language,
     required String citizenId,
     String? threadId,
     String? consentToken,
+    Map<String, String> fieldValues = const {},
   }) async {
     try {
       final response = await orchestration.post<Map<String, dynamic>>(
@@ -98,6 +100,7 @@ class AssistantRepository {
           'channel': AppConfig.channel,
           'thread_id': ?threadId,
           'consent_token': ?consentToken,
+          if (fieldValues.isNotEmpty) 'field_values': fieldValues,
         },
         options: Options(headers: {'X-Citizen-Id': citizenId}),
       );
@@ -140,10 +143,11 @@ class AssistantRepository {
     required String citizenId,
     String? threadId,
     String? consentToken,
+    Map<String, String> fieldValues = const {},
   }) async* {
     final raw = openSseStream(
       dio: orchestration,
-      path: '/v1/messages/stream',
+      path: '/v1/messages/stream/agent',
       headers: {'X-Citizen-Id': citizenId},
       body: {
         'text': text,
@@ -151,6 +155,7 @@ class AssistantRepository {
         'channel': AppConfig.channel,
         'thread_id': ?threadId,
         'consent_token': ?consentToken,
+        if (fieldValues.isNotEmpty) 'field_values': fieldValues,
       },
     );
 

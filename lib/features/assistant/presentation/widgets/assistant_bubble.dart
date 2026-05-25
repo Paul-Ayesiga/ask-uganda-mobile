@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../../core/state/preferences_controller.dart';
 import '../../../../core/theme/app_theme.dart';
+import '../../../../core/voice/voice_service.dart';
 import '../../../../core/widgets/ask_uganda_brand_mark.dart';
 import '../../domain/models/chat_message.dart';
 
-class AssistantBubble extends StatelessWidget {
+class AssistantBubble extends ConsumerWidget {
   const AssistantBubble({
     super.key,
     required this.text,
@@ -19,9 +22,10 @@ class AssistantBubble extends StatelessWidget {
   final bool isStreaming;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final showCursor = isStreaming;
     final showPreambleDots = isStreaming && text.isEmpty;
+    final canSpeak = !isStreaming && text.trim().isNotEmpty;
 
     return Align(
       alignment: Alignment.centerLeft,
@@ -44,7 +48,12 @@ class AssistantBubble extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
-              const _AssistantAttribution(),
+              Row(
+                children: [
+                  const Expanded(child: _AssistantAttribution()),
+                  if (canSpeak) _SpeakButton(text: text),
+                ],
+              ),
               const SizedBox(height: AppSpacing.sm),
               if (showPreambleDots)
                 const _PreambleDots()
@@ -76,6 +85,57 @@ class AssistantBubble extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// A compact play/stop button that triggers TTS for the bubble's text.
+/// Stateful so we can toggle its icon between speaking and idle without
+/// pushing speech state into the global controller (TTS is fire-and-
+/// forget; one bubble plays at a time, the service stops any previous
+/// playback on a fresh speak call).
+class _SpeakButton extends ConsumerStatefulWidget {
+  const _SpeakButton({required this.text});
+
+  final String text;
+
+  @override
+  ConsumerState<_SpeakButton> createState() => _SpeakButtonState();
+}
+
+class _SpeakButtonState extends ConsumerState<_SpeakButton> {
+  bool _speaking = false;
+
+  Future<void> _toggle() async {
+    final voice = ref.read(voiceServiceProvider);
+    if (_speaking) {
+      await voice.stopSpeaking();
+      if (!mounted) return;
+      setState(() => _speaking = false);
+      return;
+    }
+    final language = ref.read(preferencesControllerProvider).language.code;
+    setState(() => _speaking = true);
+    await voice.speak(widget.text, languageCode: language);
+    // FlutterTts.speak's Future resolves when playback starts (not when
+    // it ends) on iOS. We optimistically flip the icon back after a
+    // short window so a long reply doesn't leave the button stuck;
+    // tapping it again always stops cleanly.
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    if (!mounted) return;
+    setState(() => _speaking = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      tooltip: _speaking ? 'Stop' : 'Read aloud',
+      visualDensity: VisualDensity.compact,
+      onPressed: _toggle,
+      icon: Icon(
+        _speaking ? Icons.stop_rounded : Icons.volume_up_outlined,
+        size: 18,
       ),
     );
   }

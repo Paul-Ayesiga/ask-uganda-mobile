@@ -44,6 +44,19 @@ dependencies:
   # Networking
   dio: ^5.7.0
 
+  # Voice — device-native STT (iOS Speech framework / Android
+  # SpeechRecognizer) and TTS. Luganda will fall back to text-only on
+  # devices where the locale is not installed; a sovereign Whisper
+  # backend is the production path.
+  speech_to_text: ^7.0.0
+  flutter_tts: ^4.2.0
+
+  # Persistence — file-based JSON store for conversation history. We
+  # deliberately avoid a heavier local DB (Hive, Isar) at this size:
+  # the dataset is small, append-mostly, and ChatThread already has
+  # toJson/fromJson.
+  path_provider: ^2.1.5
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

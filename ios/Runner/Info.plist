@@ -46,6 +46,16 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<!--
+	  Voice input. The microphone permission is required to record
+	  audio; the speech-recognition permission is required to convert
+	  the audio into text via Apple's Speech framework. Both prompts
+	  appear the first time the citizen taps the mic.
+	-->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Ask Uganda needs the microphone so you can speak your question instead of typing it.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Ask Uganda converts your spoken question into text so it can understand and answer you in your language.</string>
+	<!--
 	  Allow cleartext HTTP to the local development backend on the
 	  simulator. This exception is scoped to localhost and 127.0.0.1
 	  only; production traffic will run over TLS and this exception

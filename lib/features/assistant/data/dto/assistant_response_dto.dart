@@ -4,6 +4,7 @@
 
 import '../../domain/models/chat_message.dart';
 import '../../domain/models/consent_proposal.dart';
+import '../../domain/models/field_request.dart';
 import '../../domain/models/verified_fact.dart';
 
 class AssistantResponseDto {
@@ -46,6 +47,7 @@ class AssistantMessageDto {
     this.verifiedFact,
     this.consentProposal,
     this.handoff,
+    this.fieldRequest,
     this.actions = const [],
   });
 
@@ -57,6 +59,11 @@ class AssistantMessageDto {
   final VerifiedFactDto? verifiedFact;
   final ConsentProposalDto? consentProposal;
   final HandoffDto? handoff;
+
+  /// The backend's FieldRequest wire shape matches the domain model
+  /// one-to-one (no client-only fields), so we reuse the domain class
+  /// here rather than maintain a parallel DTO.
+  final FieldRequest? fieldRequest;
   final List<ChatActionDto> actions;
 
   factory AssistantMessageDto.fromJson(Map<String, dynamic> json) {
@@ -80,6 +87,11 @@ class AssistantMessageDto {
       handoff: json['handoff'] == null
           ? null
           : HandoffDto.fromJson(json['handoff'] as Map<String, dynamic>),
+      fieldRequest: json['field_request'] == null
+          ? null
+          : FieldRequest.fromJson(
+              json['field_request'] as Map<String, dynamic>,
+            ),
       actions: ((json['actions'] as List?) ?? const [])
           .map((a) => ChatActionDto.fromJson(a as Map<String, dynamic>))
           .toList(growable: false),
@@ -96,6 +108,7 @@ class AssistantMessageDto {
       verifiedFact: verifiedFact?.toDomain(),
       consentProposal: consentProposal?.toDomain(),
       handoff: handoff?.toDomain(),
+      fieldRequest: fieldRequest,
       actions: actions.map((a) => a.toDomain()).toList(growable: false),
     );
   }
@@ -122,6 +135,8 @@ ChatContentKind _kindFromString(String s) {
       return ChatContentKind.handoff;
     case 'action':
       return ChatContentKind.action;
+    case 'field_request':
+      return ChatContentKind.fieldRequest;
     default:
       return ChatContentKind.text;
   }

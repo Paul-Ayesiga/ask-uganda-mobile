@@ -1,5 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Voice input. RECORD_AUDIO is required for the SpeechRecognizer
+         service; the system prompt the citizen sees comes from the
+         strings.xml resource the recogniser uses by default. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <application
         android:label="Ask Uganda"
         android:name="${applicationName}"
@@ -42,6 +46,11 @@
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- Required so SpeechRecognizer can resolve the recogniser service
+             on Android 11+. -->
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
         </intent>
     </queries>
 </manifest>

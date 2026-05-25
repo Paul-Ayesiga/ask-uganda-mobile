@@ -32,4 +32,26 @@ class ChatThread {
       languageCode: languageCode ?? this.languageCode,
     );
   }
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'title': title,
+        'language_code': languageCode,
+        'updated_at': updatedAt.toIso8601String(),
+        'messages': messages.map((m) => m.toJson()).toList(),
+      };
+
+  factory ChatThread.fromJson(Map<String, dynamic> json) {
+    return ChatThread(
+      id: json['id'] as String,
+      title: json['title'] as String? ?? 'Conversation',
+      languageCode: json['language_code'] as String? ?? 'en',
+      updatedAt:
+          DateTime.tryParse(json['updated_at'] as String? ?? '') ??
+              DateTime.now(),
+      messages: ((json['messages'] as List?) ?? const [])
+          .map((m) => ChatMessage.fromJson(m as Map<String, dynamic>))
+          .toList(growable: false),
+    );
+  }
 }

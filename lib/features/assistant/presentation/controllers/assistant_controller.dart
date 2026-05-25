@@ -4,7 +4,9 @@ import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../../core/state/preferences_controller.dart';
 import '../../data/assistant_repository.dart';
+import '../../data/conversation_store.dart';
 import '../../domain/models/chat_message.dart';
 import '../../domain/models/chat_thread.dart';
 
@@ -53,15 +55,73 @@ class AssistantState {
 const _sentinel = Object();
 
 class AssistantController extends StateNotifier<AssistantState> {
-  AssistantController(this._repository) : super(AssistantState.initial());
+  AssistantController(this._ref, this._repository, this._store)
+      : super(AssistantState.initial()) {
+    // Hydrate from disk in the background. While loading, the UI shows
+    // the seed thread; once loaded we splice in the persisted threads
+    // and pick the most recently updated one as active.
+    unawaited(_hydrate());
+  }
 
+  final Ref _ref;
   final AssistantRepository _repository;
+  final ConversationStore _store;
+
+  /// Current language preference, read at the moment we need it so a
+  /// citizen switching language in Settings affects the very next
+  /// new thread or send.
+  String get _currentLanguageCode =>
+      _ref.read(preferencesControllerProvider).language.code;
   final _idRandom = math.Random();
 
   // Per-thread bookkeeping that doesn't belong in the UI-facing state.
   final Map<String, String> _backendThreadIds = {};       // local → backend uuid
   final Map<String, String> _languageByThread = {};       // local → language
   final Map<String, String> _lastCitizenText = {};        // for consent retry
+  // Structured values the citizen has submitted on this thread via
+  // FieldRequest cards. Sent on every subsequent dispatch so the
+  // orchestrator gates correctly through the consent moment.
+  final Map<String, Map<String, String>> _fieldValuesByThread = {};
+
+  bool _hydrated = false;
+
+  Future<void> _hydrate() async {
+    final loaded = await _store.load();
+    if (loaded.isEmpty) {
+      _hydrated = true;
+      return;
+    }
+    // Order by recency descending so the most active conversation is on top.
+    final sorted = [...loaded]
+      ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    state = state.copyWith(
+      threads: sorted,
+      activeThreadId: sorted.first.id,
+    );
+    for (final t in sorted) {
+      _languageByThread[t.id] = t.languageCode;
+    }
+    _hydrated = true;
+  }
+
+  void _persist() {
+    if (!_hydrated) return;
+    _store.enqueueSave(state.threads);
+  }
+
+  @override
+  set state(AssistantState value) {
+    super.state = value;
+    // Save after every mutation. The store debounces internally so
+    // bursts (e.g. a 100-delta streaming reply) coalesce to one write.
+    _persist();
+  }
+
+  @override
+  Future<void> dispose() async {
+    await _store.flush();
+    super.dispose();
+  }
 
   // Pseudonymous citizen id — stable per process. Production would
   // derive this from a device-anchored secret stored in Keychain.
@@ -79,12 +139,15 @@ class AssistantController extends StateNotifier<AssistantState> {
   }
 
   String startNewThread() {
+    final language = _currentLanguageCode;
     final thread = ChatThread(
       id: _newId(),
       title: 'New conversation',
       messages: [_introMessage()],
       updatedAt: DateTime.now(),
+      languageCode: language,
     );
+    _languageByThread[thread.id] = language;
     state = state.copyWith(
       threads: [thread, ...state.threads],
       activeThreadId: thread.id,
@@ -127,7 +190,20 @@ class AssistantController extends StateNotifier<AssistantState> {
     required String text,
     String? consentToken,
   }) async {
-    final language = _languageByThread[threadLocalId] ?? 'en';
+    // Language preference order:
+    //   1. The backend's echo from a previous reply on this thread.
+    //   2. The thread's stored languageCode (set when the thread was
+    //      created from the citizen's then-current preference).
+    //   3. The citizen's current preference — covers the seed thread,
+    //      which is created at module load before preferences are
+    //      available.
+    final thread = state.threads.firstWhere(
+      (t) => t.id == threadLocalId,
+      orElse: () => state.activeThread,
+    );
+    final language = _languageByThread[threadLocalId] ??
+        (thread.languageCode != 'en' ? thread.languageCode : _currentLanguageCode);
+    _languageByThread[threadLocalId] = language;
     String? streamingMessageId;
     final accumulated = StringBuffer();
 
@@ -138,6 +214,7 @@ class AssistantController extends StateNotifier<AssistantState> {
         citizenId: _citizenPseudonym,
         threadId: _backendThreadIds[threadLocalId],
         consentToken: consentToken,
+        fieldValues: _fieldValuesByThread[threadLocalId] ?? const {},
       );
 
       await for (final event in stream) {
@@ -250,6 +327,44 @@ class AssistantController extends StateNotifier<AssistantState> {
         current.copyWith(messages: messages, updatedAt: DateTime.now()),
       ),
     );
+  }
+
+  // -- Field requests ------------------------------------------------------
+
+  /// Called when the citizen taps Submit on a FieldRequestCard.
+  /// Persists the value on the message (so the card flips to a
+  /// "Submitted" pill and survives reload), accumulates it for the
+  /// thread, and re-dispatches the original question so the orchestrator
+  /// can advance past the gate.
+  Future<void> submitField({
+    required String messageId,
+    required String fieldId,
+    required String value,
+  }) async {
+    final thread = state.activeThread;
+    final idx = thread.messages.indexWhere((m) => m.id == messageId);
+    if (idx == -1) return;
+
+    final submission = {fieldId: value};
+
+    // 1. Mark the card as submitted in place.
+    _updateMessage(
+      thread.id,
+      messageId,
+      (m) => m.copyWith(fieldSubmission: submission),
+    );
+
+    // 2. Accumulate for subsequent dispatches.
+    final acc = {..._fieldValuesByThread[thread.id] ?? const {}};
+    acc[fieldId] = value;
+    _fieldValuesByThread[thread.id] = acc;
+
+    // 3. Re-ask the original question; backend will gate to the next
+    //    missing field, or proceed to the consent moment.
+    final lastText = _lastCitizenText[thread.id];
+    if (lastText == null) return;
+    state = state.copyWith(isAssistantTyping: true);
+    await _dispatch(threadLocalId: thread.id, text: lastText);
   }
 
   // -- Consent moment ------------------------------------------------------
@@ -403,19 +518,52 @@ class AssistantController extends StateNotifier<AssistantState> {
   }
 
   ChatMessage _introMessage() {
+    final code = _currentLanguageCode;
     return ChatMessage(
       id: _newId(),
       role: ChatRole.assistant,
       kind: ChatContentKind.text,
       createdAt: DateTime.now(),
-      text:
-          'Hello. I am Ask Uganda. I can guide you through any government '
-          'service in your language, and — with your consent — verify your '
-          'specific situation through GUVA. What would you like help with '
-          'today?',
+      text: _introByLanguage[code] ?? _introByLanguage['en']!,
     );
   }
 }
+
+/// Localised intro shown when a new thread opens. The English version is
+/// the canonical text; other languages are native-speaker-style
+/// translations of the same content. Add a new locale here and the
+/// language picker immediately picks it up.
+const _introByLanguage = <String, String>{
+  'en':
+      'Hello. I am Ask Uganda. I can guide you through any government '
+      'service in your language, and — with your consent — verify your '
+      'specific situation through GUVA. What would you like help with '
+      'today?',
+  'lg':
+      'Mwasuze mutya. Nze Ask Uganda. Nsobola okukuyamba ku buli mpeereza '
+      'ya gavumenti mu lulimi lwo, era — ng\'okiriza — nkakase embeera '
+      'yo egakuluddeko mu GUVA. Kiki ky\'oyagala nkuyambeko leero?',
+  'nyn':
+      'Agandi. Niinye Ask Uganda. Naasobora kukuhwera aha buri mpereza '
+      'ya gavumenti mu rurimi rwawe, kandi — waaba okikiriza — naakakasa '
+      'embeera yawe ahabwa GUVA. Niki eki orikwenda nkuhwere leero?',
+  'ach':
+      'Apwoyo. An aye Ask Uganda. Atwero konyi i kit me bedo ki ticc me '
+      'gamente i leb meri, ki — ka iye — niang i kit ma in nutu kwede '
+      'kun atiyo ki GUVA. Ango ma imito an akonyi tin?',
+  'teo':
+      'Eyalama. Eong Ask Uganda. Amina aiwakit ijo ne aitemar ka ngina '
+      'gavumenti ka akirekak kon, ka — kineni — aitemar nuyenu kon '
+      'kotere GUVA. Inyo ipedoritor ne aiwakitar ijo lolo?',
+  'lgg':
+      'Mi alenga. Ma ni Ask Uganda. Ma ovule mi azita gavumenti drilea '
+      'aza ma ti pini, eyi — ka mi le — ma sasa cuni mi pini drile GUVA. '
+      'Ngori ma le ma azipi ru ondre?',
+  'sw':
+      'Habari. Mimi ni Ask Uganda. Naweza kukusaidia kupitia huduma '
+      'yoyote ya serikali kwa lugha yako, na — ukikubali — kuthibitisha '
+      'hali yako mahususi kupitia GUVA. Ungependa msaada wa nini leo?',
+};
 
 final ChatThread _seedThread = ChatThread(
   id: 'seed-thread',
@@ -438,5 +586,9 @@ final ChatThread _seedThread = ChatThread(
 
 final assistantControllerProvider =
     StateNotifierProvider<AssistantController, AssistantState>(
-      (ref) => AssistantController(ref.watch(assistantRepositoryProvider)),
+      (ref) => AssistantController(
+        ref,
+        ref.watch(assistantRepositoryProvider),
+        ref.watch(conversationStoreProvider),
+      ),
     );

@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../../../core/state/preferences_controller.dart';
 import '../../../../core/theme/app_theme.dart';
+import '../../../../core/voice/voice_service.dart';
 import '../../domain/models/chat_message.dart';
 import '../../domain/models/verified_fact.dart';
 import '../controllers/assistant_controller.dart';
@@ -11,6 +12,7 @@ import '../widgets/assistant_bubble.dart';
 import '../widgets/citizen_bubble.dart';
 import '../widgets/composer_bar.dart';
 import '../widgets/consent_moment_card.dart';
+import '../widgets/field_request_card.dart';
 import '../widgets/handoff_card.dart';
 import '../widgets/typing_indicator.dart';
 import '../widgets/verified_fact_card.dart';
@@ -47,6 +49,34 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> {
     super.dispose();
   }
 
+  /// When the citizen has voice-first input on, read every newly-completed
+  /// assistant text message aloud. We detect "newly completed" by finding
+  /// any message that was streaming in the previous state and is no
+  /// longer streaming in the next.
+  void _maybeAutoSpeak(AssistantState? previous, AssistantState next) {
+    final prefs = ref.read(preferencesControllerProvider);
+    if (!prefs.voiceFirst) return;
+    if (previous == null) return;
+
+    final prevById = {
+      for (final m in previous.activeThread.messages) m.id: m,
+    };
+    for (final m in next.activeThread.messages) {
+      if (m.kind != ChatContentKind.text) continue;
+      if (m.role != ChatRole.assistant) continue;
+      if (m.isStreaming) continue;
+      final wasStreaming = prevById[m.id]?.isStreaming ?? false;
+      if (!wasStreaming) continue;
+      final text = m.text?.trim();
+      if (text == null || text.isEmpty) continue;
+      ref
+          .read(voiceServiceProvider)
+          .speak(text, languageCode: next.activeThread.languageCode);
+      // Only one auto-speak per state delta.
+      return;
+    }
+  }
+
   void _scrollToBottom() {
     if (!_scrollController.hasClients) return;
     Future.microtask(() {
@@ -66,6 +96,7 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> {
 
     ref.listen(assistantControllerProvider, (previous, next) {
       _scrollToBottom();
+      _maybeAutoSpeak(previous, next);
     });
 
     return Scaffold(
@@ -222,6 +253,27 @@ class _MessageBuilder extends ConsumerWidget {
             HandoffCard(
               handoff: handoff,
               onOpen: () => context.push('/handoff'),
+            ),
+          ],
+        );
+      case ChatContentKind.fieldRequest:
+        final request = message.fieldRequest;
+        if (request == null) return const SizedBox.shrink();
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if ((message.text ?? '').isNotEmpty)
+              AssistantBubble(text: message.text!),
+            FieldRequestCard(
+              request: request,
+              submission: message.fieldSubmission,
+              onSubmit: (value) {
+                ref.read(assistantControllerProvider.notifier).submitField(
+                      messageId: message.id,
+                      fieldId: request.id,
+                      value: value,
+                    );
+              },
             ),
           ],
         );

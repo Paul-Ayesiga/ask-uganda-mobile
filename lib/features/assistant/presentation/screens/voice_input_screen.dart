@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -6,6 +7,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../../../core/state/preferences_controller.dart';
 import '../../../../core/theme/app_theme.dart';
+import '../../../../core/voice/voice_service.dart';
 import '../controllers/assistant_controller.dart';
 
 class VoiceInputScreen extends ConsumerStatefulWidget {
@@ -18,11 +20,13 @@ class VoiceInputScreen extends ConsumerStatefulWidget {
 class _VoiceInputScreenState extends ConsumerState<VoiceInputScreen>
     with SingleTickerProviderStateMixin {
   late final AnimationController _waveController;
-  bool _isListening = true;
-  String _transcript = '';
+  StreamSubscription<VoiceTranscript>? _subscription;
 
-  static const _placeholderTranscript =
-      'I want to renew my driving permit. It expired earlier this year.';
+  String _transcript = '';
+  bool _isListening = false;
+  bool _isInitialising = true;
+  String? _availabilityNote;
+  bool _languageSupported = false;
 
   @override
   void initState() {
@@ -31,41 +35,85 @@ class _VoiceInputScreenState extends ConsumerState<VoiceInputScreen>
       vsync: this,
       duration: const Duration(milliseconds: 1200),
     )..repeat();
-    _simulateRecognition();
+
+    // Defer until the first frame so the language preference is read
+    // from the providers in a context where Riverpod is fully wired.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _start());
   }
 
-  Future<void> _simulateRecognition() async {
-    for (var i = 1; i <= _placeholderTranscript.length; i++) {
-      if (!mounted || !_isListening) return;
-      await Future<void>.delayed(const Duration(milliseconds: 22));
-      setState(() => _transcript = _placeholderTranscript.substring(0, i));
+  Future<void> _start() async {
+    final language = ref.read(preferencesControllerProvider).language.code;
+    final availability = await ref
+        .read(voiceServiceProvider)
+        .initialiseForLanguage(language);
+
+    if (!mounted) return;
+    setState(() {
+      _isInitialising = false;
+      _languageSupported = availability.languageSupported;
+      _availabilityNote = availability.notes;
+    });
+
+    if (availability.sttReady && availability.languageSupported) {
+      _listen(language);
     }
   }
 
-  @override
-  void dispose() {
-    _waveController.dispose();
-    super.dispose();
+  void _listen(String language) {
+    setState(() {
+      _isListening = true;
+      _transcript = '';
+    });
+    _subscription = ref
+        .read(voiceServiceProvider)
+        .startListening(languageCode: language)
+        .listen(
+          (t) {
+            if (!mounted) return;
+            setState(() => _transcript = t.text);
+            if (t.isFinal) {
+              setState(() => _isListening = false);
+            }
+          },
+          onError: (e) {
+            if (!mounted) return;
+            setState(() {
+              _isListening = false;
+              _availabilityNote = 'Voice recognition stopped: $e';
+            });
+          },
+        );
+  }
+
+  Future<void> _stop() async {
+    await ref.read(voiceServiceProvider).stopListening();
+    if (!mounted) return;
+    setState(() => _isListening = false);
   }
 
   void _send() {
-    if (_transcript.trim().isEmpty) return;
-    setState(() => _isListening = false);
+    final text = _transcript.trim();
+    if (text.isEmpty) return;
     final id =
         ref.read(assistantControllerProvider.notifier).startNewThread();
-    ref
-        .read(assistantControllerProvider.notifier)
-        .sendCitizenMessage(_transcript);
+    ref.read(assistantControllerProvider.notifier).sendCitizenMessage(text);
     if (!mounted) return;
     context.pop();
     context.push('/assistant/conversation/$id');
   }
 
   @override
+  void dispose() {
+    _subscription?.cancel();
+    _waveController.dispose();
+    unawaited(ref.read(voiceServiceProvider).stopListening());
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final preferences = ref.watch(preferencesControllerProvider);
     final textTheme = Theme.of(context).textTheme;
-    final scheme = Theme.of(context).colorScheme;
 
     return Scaffold(
       backgroundColor: AppColors.forest,
@@ -128,6 +176,7 @@ class _VoiceInputScreenState extends ConsumerState<VoiceInputScreen>
                     painter: _WavePainter(
                       progress: _waveController.value,
                       color: AppColors.flagYellow,
+                      activeBars: _isListening ? 18 : 6,
                     ),
                   );
                 },
@@ -139,9 +188,7 @@ class _VoiceInputScreenState extends ConsumerState<VoiceInputScreen>
               child: AnimatedSwitcher(
                 duration: const Duration(milliseconds: 200),
                 child: Text(
-                  _transcript.isEmpty
-                      ? 'Listening… speak naturally in ${preferences.language.englishName}.'
-                      : _transcript,
+                  _displayedText(preferences.language.englishName),
                   key: ValueKey(_transcript),
                   textAlign: TextAlign.center,
                   style: textTheme.titleLarge?.copyWith(
@@ -151,6 +198,19 @@ class _VoiceInputScreenState extends ConsumerState<VoiceInputScreen>
                 ),
               ),
             ),
+            if (_availabilityNote != null) ...[
+              const SizedBox(height: AppSpacing.md),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xl),
+                child: Text(
+                  _availabilityNote!,
+                  textAlign: TextAlign.center,
+                  style: textTheme.bodyMedium?.copyWith(
+                    color: Colors.white.withValues(alpha: 0.78),
+                  ),
+                ),
+              ),
+            ],
             const Spacer(),
             Padding(
               padding: const EdgeInsets.all(AppSpacing.lg),
@@ -164,7 +224,10 @@ class _VoiceInputScreenState extends ConsumerState<VoiceInputScreen>
                           color: Colors.white.withValues(alpha: 0.5),
                         ),
                       ),
-                      onPressed: () => context.pop(),
+                      onPressed: () {
+                        unawaited(_stop());
+                        context.pop();
+                      },
                       icon: const Icon(Icons.keyboard_alt_outlined),
                       label: const Text('Type instead'),
                     ),
@@ -176,7 +239,7 @@ class _VoiceInputScreenState extends ConsumerState<VoiceInputScreen>
                         backgroundColor: AppColors.flagYellow,
                         foregroundColor: AppColors.flagBlack,
                       ),
-                      onPressed: _send,
+                      onPressed: _transcript.trim().isEmpty ? null : _send,
                       icon: const Icon(Icons.send_rounded),
                       label: const Text('Send'),
                     ),
@@ -193,20 +256,33 @@ class _VoiceInputScreenState extends ConsumerState<VoiceInputScreen>
                 ),
               ),
             ),
-            // Hidden ref to scheme to avoid analyzer warning if removed later.
-            SizedBox(height: 0, child: ColoredBox(color: scheme.primary)),
           ],
         ),
       ),
     );
   }
+
+  String _displayedText(String langLabel) {
+    if (_isInitialising) return 'Getting ready…';
+    if (_transcript.isNotEmpty) return _transcript;
+    if (!_languageSupported) {
+      return 'Voice is not yet available for $langLabel.';
+    }
+    if (_isListening) return 'Listening… speak naturally in $langLabel.';
+    return 'Tap Type instead, or close to go back.';
+  }
 }
 
 class _WavePainter extends CustomPainter {
-  const _WavePainter({required this.progress, required this.color});
+  const _WavePainter({
+    required this.progress,
+    required this.color,
+    required this.activeBars,
+  });
 
   final double progress;
   final Color color;
+  final int activeBars;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -220,6 +296,7 @@ class _WavePainter extends CustomPainter {
     final base = size.height / 2;
 
     for (var i = 0; i < barCount; i++) {
+      if (i >= activeBars) continue;
       final phase = (progress * 2 * math.pi) + (i * 0.4);
       final amplitude = (math.sin(phase).abs()) * 0.6 + 0.18;
       final height = size.height * amplitude;
@@ -234,6 +311,7 @@ class _WavePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _WavePainter oldDelegate) {
-    return oldDelegate.progress != progress;
+    return oldDelegate.progress != progress ||
+        oldDelegate.activeBars != activeBars;
   }
 }
